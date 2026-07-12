@@ -1,1 +1,453 @@
-iii
+  # Safe DNS Cutover Test with AWS ALB, ACM, Kubernetes/Kong, and Google Cloud DNS
+
+  ## Purpose
+
+  This document explains a safe, reversible approach for testing a production website cutover from an existing website to a new application running behind an AWS Application Load Balancer.
+
+  The goal is to validate the new infrastructure before permanently moving the main domain.
+
+  This process covers:
+
+  - Preparing HTTPS certificates
+  - Validating DNS ownership
+  - Attaching certificates to AWS ALB
+  - Updating ALB host routing
+  - Testing application routing
+  - Performing a temporary DNS cutover
+  - Rolling back safely
+
+  ## Architecture Overview
+
+  Before cutover:
+
+  ```text
+  <ROOT_DOMAIN>              -> Old website IP
+  www.<ROOT_DOMAIN>          -> CNAME <ROOT_DOMAIN>
+  staging/prod subdomain     -> AWS ALB -> Kubernetes/Kong -> Application
+
+  During test cutover:
+
+  <ROOT_DOMAIN>              -> AWS ALB IPs
+  www.<ROOT_DOMAIN>          -> CNAME <ROOT_DOMAIN>
+  AWS ALB                    -> Kubernetes/Kong -> Application
+
+  Rollback:
+
+  <ROOT_DOMAIN>              -> Old website IP
+  www.<ROOT_DOMAIN>          -> CNAME <ROOT_DOMAIN>
+
+  ## Variables Used
+
+  Replace these placeholders before running commands:
+
+  AWS_REGION="<AWS_REGION>"
+  ROOT_DOMAIN="<example.com>"
+  WWW_DOMAIN="www.<example.com>"
+  PROD_DOMAIN="prod.<example.com>"
+  OLD_WEBSITE_IP="<OLD_WEBSITE_IP>"
+  ALB_DNS_NAME="<AWS_ALB_DNS_NAME>"
+  NEW_CERT_ARN="<NEW_ACM_CERTIFICATE_ARN>"
+  OLD_CERT_ARN="<OLD_ACM_CERTIFICATE_ARN>"
+  LISTENER_ARN="<ALB_HTTPS_LISTENER_ARN>"
+  RULE_ARN="<ALB_FORWARDING_RULE_ARN>"
+  TARGET_GROUP_ARN="<ALB_TARGET_GROUP_ARN>"
+
+  Example AWS region:
+
+  AWS_REGION="ap-southeast-2"
+
+  ## Step 1: Confirm Current DNS
+
+  Check where the root domain and www currently point.
+
+  dig +short <ROOT_DOMAIN> A
+  dig +short www.<ROOT_DOMAIN> CNAME
+  dig +short www.<ROOT_DOMAIN> A
+
+  Expected before cutover:
+
+  <ROOT_DOMAIN> -> old website IP
+  www.<ROOT_DOMAIN> -> CNAME <ROOT_DOMAIN>
+
+  ## Step 2: Verify Current Application URL
+
+  Confirm the new application works on its temporary production/staging domain.
+
+  curl -Iv https://<PROD_DOMAIN>/
+  curl -Iv https://<PROD_DOMAIN>/app
+
+  If the application only works under /app, configure the gateway or reverse proxy so root / redirects to /app.
+
+  Expected behavior:
+
+  https://<PROD_DOMAIN>/     -> 302 /app
+  https://<PROD_DOMAIN>/app  -> 200
+
+  ## Step 3: Configure Root Redirect in Kong
+
+  If using Kong, create or update a root-only route that redirects / to /app.
+
+  Example using Kong Admin API from inside Kubernetes:
+
+  kubectl --context <KUBE_CONTEXT> run kong-root-route \
+    --rm -i --restart=Never \
+    -n <NAMESPACE> \
+    --image=curlimages/curl:8.10.1 \
+    --command -- curl -s -X POST \
+    http://<KONG_ADMIN_SERVICE>:8001/services/<SERVICE_NAME>/routes \
+    --data name=root-redirect-route \
+    --data-urlencode 'paths[]=~/$' \
+    --data regex_priority=300 \
+    --data 'methods[]=GET' \
+    --data 'methods[]=HEAD' \
+    --data strip_path=false
+
+  Attach a Kong pre-function plugin to return a redirect:
+
+  kubectl --context <KUBE_CONTEXT> run kong-root-plugin \
+    --rm -i --restart=Never \
+    -n <NAMESPACE> \
+    --image=curlimages/curl:8.10.1 \
+    --command -- curl -s -X POST \
+    http://<KONG_ADMIN_SERVICE>:8001/routes/<ROOT_ROUTE_ID>/plugins \
+    --data name=pre-function \
+    --data-urlencode 'config.access[]=kong.response.exit(302, "", {["Location"]="/app"})'
+
+  Verify:
+
+  curl -Iv https://<PROD_DOMAIN>/
+  curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://<PROD_DOMAIN>/
+  curl -s -o /dev/null -w '%{http_code}\n' https://<PROD_DOMAIN>/app
+
+  Expected:
+
+  /     -> 302 /app
+  /app  -> 200
+
+  ## Step 4: Request a New AWS ACM Certificate
+
+  Request a new ACM certificate that covers all required hostnames.
+
+  Do not modify live traffic yet.
+
+  aws acm request-certificate \
+    --region <AWS_REGION> \
+    --domain-name <ROOT_DOMAIN> \
+    --subject-alternative-names www.<ROOT_DOMAIN> <PROD_DOMAIN> \
+    --validation-method DNS \
+    --idempotency-token safe-cutover-$(date +%Y%m%d)
+
+  The command returns:
+
+  {
+    "CertificateArn": "<NEW_CERT_ARN>"
+  }
+
+  Save the certificate ARN.
+
+  ## Step 5: Get DNS Validation Records
+
+  Describe the certificate:
+
+  aws acm describe-certificate \
+    --region <AWS_REGION> \
+    --certificate-arn <NEW_CERT_ARN>
+
+  Look for DomainValidationOptions.
+
+  You will get CNAME records like:
+
+  Name:  _xxxxxxxx.<ROOT_DOMAIN>.
+  Type:  CNAME
+  Value: _yyyyyyyy.acm-validations.aws.
+
+  Name:  _xxxxxxxx.www.<ROOT_DOMAIN>.
+  Type:  CNAME
+  Value: _yyyyyyyy.acm-validations.aws.
+
+  ## Step 6: Add ACM Validation Records in Google Cloud DNS
+
+  In Google Cloud Console:
+
+  Cloud DNS
+  -> DNS zones
+  -> Select your domain zone
+  -> Add standard
+
+  Add each ACM validation record:
+
+  DNS name: <ACM_VALIDATION_RECORD_NAME>
+  Type: CNAME
+  TTL: 300
+  Canonical name: <ACM_VALIDATION_RECORD_VALUE>
+
+  Do not modify production A records yet.
+
+  ## Step 7: Verify DNS Validation Propagation
+
+  Check that the CNAMEs resolve publicly:
+
+  dig +short CNAME <ACM_VALIDATION_RECORD_NAME_FOR_ROOT>
+  dig +short CNAME <ACM_VALIDATION_RECORD_NAME_FOR_WWW>
+
+  Expected output should match the ACM validation values.
+
+  ## Step 8: Wait for ACM Certificate to Become Issued
+
+  Check certificate status:
+
+  aws acm describe-certificate \
+    --region <AWS_REGION> \
+    --certificate-arn <NEW_CERT_ARN>
+
+  Expected:
+
+  Status: ISSUED
+
+  Also confirm all domains show:
+
+  ValidationStatus: SUCCESS
+
+  ## Step 9: Identify the Production ALB
+
+  List load balancers:
+
+  aws elbv2 describe-load-balancers \
+    --region <AWS_REGION>
+
+  Find the ALB currently serving the temporary production domain.
+
+  You can also inspect the current certificate to see which ALB is using it:
+
+  aws acm describe-certificate \
+    --region <AWS_REGION> \
+    --certificate-arn <OLD_CERT_ARN>
+
+  Look for:
+
+  InUseBy
+
+  ## Step 10: Identify the HTTPS Listener
+
+  Describe ALB listeners:
+
+  aws elbv2 describe-listeners \
+    --region <AWS_REGION> \
+    --load-balancer-arn <LOAD_BALANCER_ARN>
+
+  Find the HTTPS listener:
+
+  Protocol: HTTPS
+  Port: 443
+
+  Save the listener ARN.
+
+  ## Step 11: Attach the New Certificate to the ALB Listener
+
+  Add the new certificate as an additional SNI certificate.
+
+  This is safer than replacing the default certificate immediately.
+
+  aws elbv2 add-listener-certificates \
+    --region <AWS_REGION> \
+    --listener-arn <LISTENER_ARN> \
+    --certificates CertificateArn=<NEW_CERT_ARN>
+
+  Verify listener certificates:
+
+  aws elbv2 describe-listener-certificates \
+    --region <AWS_REGION> \
+    --listener-arn <LISTENER_ARN>
+
+  Expected:
+
+  Old certificate: default
+  New certificate: attached as SNI
+
+  ## Step 12: Verify Certificate Selection Before DNS Cutover
+
+  Test the ALB directly using SNI, without changing DNS.
+
+  openssl s_client \
+    -connect <ALB_DNS_NAME>:443 \
+    -servername <ROOT_DOMAIN> </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+  Repeat for www:
+
+  openssl s_client \
+    -connect <ALB_DNS_NAME>:443 \
+    -servername www.<ROOT_DOMAIN> </dev/null 2>/dev/null \
+    | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+  Expected SANs:
+
+  DNS:<ROOT_DOMAIN>
+  DNS:www.<ROOT_DOMAIN>
+  DNS:<PROD_DOMAIN>
+
+  ## Step 13: Update ALB Host Routing Rule
+
+  Check existing listener rules:
+
+  aws elbv2 describe-rules \
+    --region <AWS_REGION> \
+    --listener-arn <LISTENER_ARN>
+
+  If the ALB only forwards traffic for <PROD_DOMAIN>, update the host-header condition to include:
+
+  <PROD_DOMAIN>
+  <ROOT_DOMAIN>
+  www.<ROOT_DOMAIN>
+
+  Example:
+
+  aws elbv2 modify-rule \
+    --region <AWS_REGION> \
+    --rule-arn <RULE_ARN> \
+    --conditions \
+      Field=path-pattern,Values='/*' \
+      Field=host-header,Values=<PROD_DOMAIN>,<ROOT_DOMAIN>,www.<ROOT_DOMAIN>
+
+  Verify again:
+
+  aws elbv2 describe-rules \
+    --region <AWS_REGION> \
+    --listener-arn <LISTENER_ARN>
+
+  ## Step 14: Test ALB Routing Before DNS Cutover
+
+  Use curl --connect-to to test the future DNS behavior without changing DNS.
+
+  curl -Iv \
+    --connect-to <ROOT_DOMAIN>:443:<ALB_DNS_NAME>:443 \
+    https://<ROOT_DOMAIN>/
+
+  Test www:
+
+  curl -Iv \
+    --connect-to www.<ROOT_DOMAIN>:443:<ALB_DNS_NAME>:443 \
+    https://www.<ROOT_DOMAIN>/
+
+  Expected:
+
+  SSL certificate valid
+  HTTP 302 Location: /app
+
+  ## Step 15: Perform Temporary DNS Cutover
+
+  In Google Cloud DNS:
+
+  Cloud DNS
+  -> DNS zones
+  -> Select your domain zone
+  -> Find <ROOT_DOMAIN>. A record
+  -> Edit
+
+  Replace the old IP with the AWS ALB IPs.
+
+  Get ALB IPs:
+
+  dig +short <ALB_DNS_NAME> A
+
+  Update root A record:
+
+  DNS name: <ROOT_DOMAIN>.
+  Type: A
+  TTL: 300
+  IPv4 addresses:
+  <ALB_IP_1>
+  <ALB_IP_2>
+  <ALB_IP_3>
+
+  Leave www unchanged if it is already:
+
+  www.<ROOT_DOMAIN>. CNAME <ROOT_DOMAIN>.
+
+  ## Step 16: Verify DNS Cutover
+
+  Check DNS:
+
+  dig +short <ROOT_DOMAIN> A
+  dig +short www.<ROOT_DOMAIN> CNAME
+  dig +short www.<ROOT_DOMAIN> A
+
+  Check HTTPS behavior:
+
+  curl -s -o /dev/null -w 'apex %{remote_ip} %{http_code} %{redirect_url}\n' \
+    https://<ROOT_DOMAIN>/
+
+  curl -s -o /dev/null -w 'www %{remote_ip} %{http_code} %{redirect_url}\n' \
+    https://www.<ROOT_DOMAIN>/
+
+  Expected:
+
+  apex <ALB_IP> 302 https://<ROOT_DOMAIN>/app
+  www   <ALB_IP> 302 https://www.<ROOT_DOMAIN>/app
+
+  ## Step 17: Browser Testing
+
+  Test in browser:
+
+  https://<ROOT_DOMAIN>
+  https://www.<ROOT_DOMAIN>
+
+  Expected:
+
+  Both should load the new application.
+
+  If the browser still shows the old site, clear local DNS/browser cache or wait for TTL propagation.
+
+  On macOS:
+
+  sudo dscacheutil -flushcache
+  sudo killall -HUP mDNSResponder
+
+  ## Step 18: Rollback
+
+  To roll back, change only the root A record back to the previous website IP.
+
+  In Google Cloud DNS:
+
+  <ROOT_DOMAIN>.
+  Type: A
+  Value: <OLD_WEBSITE_IP>
+  TTL: 300
+
+  If www is a CNAME to root, no separate rollback is needed:
+
+  www.<ROOT_DOMAIN>. CNAME <ROOT_DOMAIN>.
+
+  Verify rollback:
+
+  dig +short <ROOT_DOMAIN> A
+  curl -Iv https://<ROOT_DOMAIN>/
+  curl -Iv https://www.<ROOT_DOMAIN>/
+
+  Expected:
+
+  <ROOT_DOMAIN> resolves to old website IP
+  www follows root domain
+  Old website loads again
+
+  ## What Was Left in Place
+
+  The following changes can safely remain after rollback:
+
+  - New AWS ACM certificate
+  - ACM DNS validation CNAME records
+  - ALB SNI certificate attachment
+  - ALB host rule supporting root and www domains
+  - Gateway root redirect rule
+
+  These make the final future cutover easier and safer.
+
+  ## Key Lessons
+
+  - Do not change DNS before certificates are ready.
+  - Always validate ACM certificates before attaching them to live infrastructure.
+  - Attach new certificates as SNI first where possible.
+  - Test ALB routing using curl --connect-to before DNS cutover.
+  - Keep TTL low during migration windows.
+  - Ensure rollback is a single, simple DNS change.
+  - Avoid deleting validation records after ACM issuance because they help with certificate renewal.
